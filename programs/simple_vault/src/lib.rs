@@ -1,13 +1,12 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
 
-declare_id!("EnnLxUs8kh7Ctuvc5DPs3sjn9wcM6k8XEVpjPs1Pi9ta"); // Заполнится автоматически при anchor keys sync
+declare_id!("EnnLxUs8kh7Ctuvc5DPs3sjn9wcM6k8XEVpjPs1Pi9ta");
 
 #[program]
 pub mod simple_vault {
     use super::*;
 
-    // 1. Инициализация Vault (хранилища)
     pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
         let vault_state = &mut ctx.accounts.vault_state;
         vault_state.admin = ctx.accounts.admin.key();
@@ -20,7 +19,6 @@ pub mod simple_vault {
         Ok(())
     }
 
-    // 2. Создание личной карточки пользователя
     pub fn create_user_card(ctx: Context<CreateUserCard>) -> Result<()> {
         let user_card = &mut ctx.accounts.user_card;
         user_card.vault = ctx.accounts.vault_state.key();
@@ -30,9 +28,70 @@ pub mod simple_vault {
         user_card.bump = ctx.bumps.user_card;
         Ok(())
     }
-}
 
-// --- Структуры контекста для инструкций ---
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        require!(amount > 0, VaultError::ZeroAmount);
+
+        let vault_state = &ctx.accounts.vault_state;
+        let shares = if vault_state.total_shares == 0 || vault_state.total_tokens == 0 {
+            amount
+        } else {
+            (amount as u128)
+                .checked_mul(vault_state.total_shares as u128)
+                .ok_or(VaultError::MathOverflow)?
+                .checked_div(vault_state.total_tokens as u128)
+                .ok_or(VaultError::MathOverflow)? as u64
+        };
+        require!(shares > 0, VaultError::ZeroAmount);
+
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_token_account.to_account_info(),
+                to: ctx.accounts.vault_token_account.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        );
+        token::transfer(transfer_ctx, amount)?;
+
+        let token_mint_key = ctx.accounts.vault_state.token_mint;
+        let bump = ctx.accounts.vault_state.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", token_mint_key.as_ref(), &[bump]]];
+
+        let mint_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.share_mint.to_account_info(),
+                to: ctx.accounts.user_share_account.to_account_info(),
+                authority: ctx.accounts.vault_state.to_account_info(),
+            },
+            signer_seeds,
+        );
+        token::mint_to(mint_ctx, shares)?;
+
+        let vault_state = &mut ctx.accounts.vault_state;
+        vault_state.total_tokens = vault_state
+            .total_tokens
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
+        vault_state.total_shares = vault_state
+            .total_shares
+            .checked_add(shares)
+            .ok_or(VaultError::MathOverflow)?;
+
+        let user_card = &mut ctx.accounts.user_card;
+        user_card.deposited = user_card
+            .deposited
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
+        user_card.shares = user_card
+            .shares
+            .checked_add(shares)
+            .ok_or(VaultError::MathOverflow)?;
+
+        Ok(())
+    }
+}
 
 #[derive(Accounts)]
 pub struct InitializeVault<'info> {
@@ -94,7 +153,51 @@ pub struct CreateUserCard<'info> {
     pub system_program: Program<'info, System>,
 }
 
-// --- Структуры данных (аккаунты в блокчейне) ---
+#[derive(Accounts)]
+pub struct Deposit<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+        has_one = vault_token_account,
+        has_one = share_mint,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    #[account(
+        mut,
+        seeds = [b"user_card", vault_state.key().as_ref(), user.key().as_ref()],
+        bump = user_card.bump,
+        constraint = user_card.owner == user.key(),
+        constraint = user_card.vault == vault_state.key(),
+    )]
+    pub user_card: Account<'info, UserCard>,
+
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub share_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = user_token_account.owner == user.key(),
+        constraint = user_token_account.mint == vault_state.token_mint,
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = user_share_account.owner == user.key(),
+        constraint = user_share_account.mint == share_mint.key(),
+    )]
+    pub user_share_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
 
 #[account]
 #[derive(InitSpace)]
@@ -116,4 +219,12 @@ pub struct UserCard {
     pub deposited: u64,
     pub shares: u64,
     pub bump: u8,
+}
+
+#[error_code]
+pub enum VaultError {
+    #[msg("Amount must be greater than zero")]
+    ZeroAmount,
+    #[msg("Math overflow")]
+    MathOverflow,
 }
