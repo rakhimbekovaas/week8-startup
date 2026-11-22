@@ -1,64 +1,76 @@
-/**
- * Неделя 11: свои тестовые токены + свой CLMM-пул на Raydium (devnet).
- *
- * Что делает скрипт:
- *   1. Создаёт два SPL-токена (decimals = 6) и минтит их на твой кошелёк
- *   2. Создаёт CLMM-пул TOKEN_A / TOKEN_B на Raydium devnet
- *   3. Сохраняет адреса в devnet-pool.json (пригодится на неделях 12-13)
- *
- * Запуск:
- *   yarn create-pool
- *
- * Кошелёк: ANCHOR_WALLET или ~/.config/solana/id.json. RPC: DEVNET_RPC или публичный devnet.
- */
-
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import Decimal from "decimal.js";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import {
-  TOKEN_PROGRAM_ID,
   createMint,
   getOrCreateAssociatedTokenAccount,
   mintTo,
 } from "@solana/spl-token";
-import { Raydium, DEVNET_PROGRAM_ID, DEV_API_URLS, TxVersion } from "@raydium-io/raydium-sdk-v2";
-import Decimal from "decimal.js";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Настройки
-// ─────────────────────────────────────────────────────────────────────────────
-
-const RPC_URL = process.env.DEVNET_RPC ?? "https://api.devnet.solana.com";
+const RAYDIUM_CLMM_DEVNET = new PublicKey(
+  "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH"
+);
 const DECIMALS = 6;
-const MINT_AMOUNT = 1_000_000; // сколько токенов каждого вида минтим себе (целых)
-const INITIAL_PRICE = 1; // стартовая цена: 1 TOKEN_A = 1 TOKEN_B
-const TICK_SPACING = 60; // 60 — стандартный шаг для обычных пар (комиссия 0.25%)
-const OUT_FILE = path.join(__dirname, "..", "devnet-pool.json");
+const MINT_AMOUNT = 1_000_000 * 10 ** DECIMALS;
+const TARGET_TICK_SPACING = 60;
+const TARGET_FEE_RATE = 2500; // 0.25%
+const INITIAL_PRICE = new Decimal(1);
 
-function loadWallet(): Keypair {
-  const keyPath = process.env.ANCHOR_WALLET ?? path.join(os.homedir(), ".config", "solana", "id.json");
-  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(keyPath, "utf-8"))));
+function loadKeypair(): Keypair {
+  const walletPath =
+    process.env.ANCHOR_WALLET ||
+    path.join(os.homedir(), ".config", "solana", "id.json");
+  const resolved = walletPath.startsWith("~")
+    ? path.join(os.homedir(), walletPath.slice(1))
+    : walletPath;
+  const secret = JSON.parse(fs.readFileSync(resolved, "utf-8"));
+  return Keypair.fromSecretKey(Uint8Array.from(secret));
 }
 
 async function main() {
-  const owner = loadWallet();
-  const connection = new Connection(RPC_URL, "confirmed");
-  console.log("Кошелёк:", owner.publicKey.toBase58());
-  console.log("Баланс :", (await connection.getBalance(owner.publicKey)) / 1e9, "SOL");
+  const rpcUrl = process.env.DEVNET_RPC || "https://api.devnet.solana.com";
+  const connection = new Connection(rpcUrl, "confirmed");
+  const owner = loadKeypair();
 
-  // ─── 1. Свои токены ────────────────────────────────────────────────────────
-  console.log("\n[1/3] Создаю тестовые токены...");
-  const mintA = await createMint(connection, owner, owner.publicKey, null, DECIMALS);
-  const mintB = await createMint(connection, owner, owner.publicKey, null, DECIMALS);
-  for (const [name, mint] of [["TOKEN_A", mintA], ["TOKEN_B", mintB]] as const) {
-    const ata = await getOrCreateAssociatedTokenAccount(connection, owner, mint, owner.publicKey);
-    await mintTo(connection, owner, mint, ata.address, owner, BigInt(MINT_AMOUNT) * BigInt(10 ** DECIMALS));
-    console.log(`  ${name}: ${mint.toBase58()} (заминчено ${MINT_AMOUNT})`);
-  }
+  console.log("[1/3] Создаю тестовые токены...");
+  const tokenAMint = await createMint(
+    connection,
+    owner,
+    owner.publicKey,
+    null,
+    DECIMALS
+  );
+  const tokenBMint = await createMint(
+    connection,
+    owner,
+    owner.publicKey,
+    null,
+    DECIMALS
+  );
 
-  // ─── 2. CLMM-пул на Raydium ────────────────────────────────────────────────
-  console.log("\n[2/3] Создаю CLMM-пул на Raydium devnet...");
+  const ataA = await getOrCreateAssociatedTokenAccount(
+    connection,
+    owner,
+    tokenAMint,
+    owner.publicKey
+  );
+  const ataB = await getOrCreateAssociatedTokenAccount(
+    connection,
+    owner,
+    tokenBMint,
+    owner.publicKey
+  );
+
+  await mintTo(connection, owner, tokenAMint, ataA.address, owner, MINT_AMOUNT);
+  await mintTo(connection, owner, tokenBMint, ataB.address, owner, MINT_AMOUNT);
+
+  console.log(`  TOKEN_A: ${tokenAMint.toBase58()}`);
+  console.log(`  TOKEN_B: ${tokenBMint.toBase58()}`);
+
+  console.log("[2/3] Создаю CLMM-пул на Raydium devnet...");
   const raydium = await Raydium.load({
     owner,
     connection,
@@ -66,53 +78,76 @@ async function main() {
     disableFeatureCheck: true,
     disableLoadToken: true,
     blockhashCommitment: "finalized",
-    urlConfigs: DEV_API_URLS,
   });
 
-  // Конфиг комиссий берём из API Raydium (devnet)
   const configs = await raydium.api.getClmmConfigs();
-  const config = configs.find((c) => c.tickSpacing === TICK_SPACING) ?? configs[0];
-  if (!config) throw new Error("Raydium API не вернул ни одного CLMM-конфига");
-  console.log(`  Конфиг: ${config.id} (tickSpacing=${config.tickSpacing}, fee=${config.tradeFeeRate / 10000}%)`);
+  const matchedConfig =
+    configs.find(
+      (c: any) =>
+        c.tickSpacing === TARGET_TICK_SPACING &&
+        (c.tradeFeeRate === TARGET_FEE_RATE || c.feeRate === TARGET_FEE_RATE)
+    ) || configs.find((c: any) => c.tickSpacing === TARGET_TICK_SPACING);
 
-  const token = (mint: PublicKey) =>
-    ({ address: mint.toBase58(), programId: TOKEN_PROGRAM_ID.toBase58(), decimals: DECIMALS } as any);
+  if (!matchedConfig) {
+    throw new Error(
+      `Не найден CLMM конфиг с tickSpacing=${TARGET_TICK_SPACING}`
+    );
+  }
+
+  const [mint0, mint1] =
+    tokenAMint.toBuffer().compare(tokenBMint.toBuffer()) < 0
+      ? [tokenAMint, tokenBMint]
+      : [tokenBMint, tokenAMint];
+
+  const mint0Info = await raydium.token.getTokenInfo(mint0.toBase58());
+  const mint1Info = await raydium.token.getTokenInfo(mint1.toBase58());
+
+  const ammConfig: any = {
+    ...matchedConfig,
+    id: new PublicKey(matchedConfig.id),
+    fundOwner: "",
+  };
 
   const { execute, extInfo } = await raydium.clmm.createPool({
-    programId: DEVNET_PROGRAM_ID.CLMM_PROGRAM_ID,
-    mint1: token(mintA),
-    mint2: token(mintB),
-    ammConfig: { ...config, id: new PublicKey(config.id), fundOwner: "", description: "" } as any,
-    initialPrice: new Decimal(INITIAL_PRICE),
+    programId: RAYDIUM_CLMM_DEVNET,
+    mint1: mint0Info,
+    mint2: mint1Info,
+    ammConfig,
+    initialPrice: INITIAL_PRICE,
     txVersion: TxVersion.V0,
   });
-  const { txId } = await execute({ sendAndConfirm: true });
-  const poolId = String((extInfo as any).address.id);
-  console.log("  Pool:", poolId);
-  console.log("  Tx  :", `https://explorer.solana.com/tx/${txId}?cluster=devnet`);
 
-  // ─── 3. Сохраняем адреса ───────────────────────────────────────────────────
-  console.log("\n[3/3] Сохраняю", OUT_FILE);
-  fs.writeFileSync(
-    OUT_FILE,
-    JSON.stringify(
-      {
-        cluster: "devnet",
-        clmmProgram: DEVNET_PROGRAM_ID.CLMM_PROGRAM_ID.toBase58(),
-        tokenA: mintA.toBase58(),
-        tokenB: mintB.toBase58(),
-        poolId,
-        ammConfig: config.id.toString(),
-        tx: txId,
-      },
-      null,
-      2
-    ) + "\n"
-  );
-  console.log("\nГотово. Пул виден на https://explorer.solana.com/address/" + poolId + "?cluster=devnet");
+  const { txId } = await execute({ sendAndConfirm: true });
+  const extAny = extInfo as any;
+  const rawPool = extAny?.id ?? extAny?.poolId ?? extAny?.address ?? "";
+  const poolId =
+    typeof rawPool === "string"
+      ? rawPool
+      : rawPool?.toBase58?.() ?? rawPool?.toString?.() ?? "";
+
+  console.log(`  Pool: ${poolId}`);
+  console.log(`  Tx  : https://explorer.solana.com/tx/${txId}?cluster=devnet`);
+
+  console.log("[3/3] Сохраняю devnet-pool.json");
+  const out = {
+    cluster: "devnet",
+    programId: RAYDIUM_CLMM_DEVNET.toBase58(),
+    wallet: owner.publicKey.toBase58(),
+    tokenA: tokenAMint.toBase58(),
+    tokenB: tokenBMint.toBase58(),
+    mint0: mint0.toBase58(),
+    mint1: mint1.toBase58(),
+    poolId,
+    ammConfigId: matchedConfig.id,
+    tickSpacing: matchedConfig.tickSpacing,
+    initialPrice: INITIAL_PRICE.toString(),
+    txId,
+  };
+
+  fs.writeFileSync("devnet-pool.json", JSON.stringify(out, null, 2) + "\n");
 }
 
-main().catch((e) => {
-  console.error(e);
+main().catch((err) => {
+  console.error(err);
   process.exit(1);
 });
